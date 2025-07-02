@@ -1,0 +1,452 @@
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+import os
+import time
+import tiktoken
+import numpy as np
+
+# Google Colaboratory用の初期設定部分を追加
+print("Google Colaboratory用RAGシステム")
+print("=" * 50)
+print("必要なパッケージのインストール...")
+
+# 必要な場合のみインストール（コメントアウト状態）
+"""
+!pip install langchain
+!pip install langchain-openai
+!pip install langchain-community
+!pip install pymupdf
+!pip install tiktoken
+!pip install numpy
+"""
+
+# APIキー設定の確認
+if "OPENAI_API_KEY" not in os.environ:
+    print("⚠️  OpenAI APIキーが設定されていません。")
+    print("以下のいずれかの方法で設定してください：")
+    print("1. Google Colabのsecrets機能を使用")
+    print("2. 直接環境変数に設定")
+    print()
+    
+    # 手動でAPIキーを設定する場合
+    # api_key = input("OpenAI APIキーを入力してください: ")
+    # os.environ["OPENAI_API_KEY"] = api_key
+
+print("初期設定完了")
+
+# RetrievalQAの簡易実装
+class SimpleRetrievalQA:
+    def __init__(self, llm, retriever, chain_type="stuff"):
+        self.llm = llm
+        self.retriever = retriever
+        self.chain_type = chain_type
+    
+    def __call__(self, inputs):
+        query = inputs["query"]
+        
+        # 関連文書を取得
+        docs = self.retriever.get_relevant_documents(query)
+        
+        if self.chain_type == "stuff":
+            return self._stuff_chain(query, docs)
+        elif self.chain_type == "map_reduce":
+            return self._map_reduce_chain(query, docs)
+        elif self.chain_type == "refine":
+            return self._refine_chain(query, docs)
+        elif self.chain_type == "map_rerank":
+            return self._map_rerank_chain(query, docs)
+        else:
+            return self._stuff_chain(query, docs)
+    
+    def _stuff_chain(self, query, docs):
+        context = "\n\n".join([doc.page_content for doc in docs])
+        prompt = f"以下のコンテキストを使用して質問に答えてください。\n\nコンテキスト:\n{context}\n\n質問: {query}\n\n回答:"
+        
+        response = self.llm.invoke(prompt)
+        return {
+            "result": response.content,
+            "source_documents": docs
+        }
+    
+    def _map_reduce_chain(self, query, docs):
+        # 各文書に対して個別に質問
+        individual_answers = []
+        for doc in docs:
+            prompt = f"以下の文書を使用して質問に答えてください。\n\n文書:\n{doc.page_content}\n\n質問: {query}\n\n回答:"
+            response = self.llm.invoke(prompt)
+            individual_answers.append(response.content)
+        
+        # 回答を統合
+        combined_prompt = f"以下の複数の回答を統合して、質問に対する最終的な回答を作成してください。\n\n個別回答:\n" + "\n".join([f"{i+1}. {ans}" for i, ans in enumerate(individual_answers)]) + f"\n\n質問: {query}\n\n統合された回答:"
+        
+        final_response = self.llm.invoke(combined_prompt)
+        return {
+            "result": final_response.content,
+            "source_documents": docs
+        }
+    
+    def _refine_chain(self, query, docs):
+        if not docs:
+            return {"result": "関連する情報が見つかりませんでした。", "source_documents": []}
+        
+        # 最初の文書で初期回答を生成
+        initial_prompt = f"以下の文書を使用して質問に答えてください。\n\n文書:\n{docs[0].page_content}\n\n質問: {query}\n\n回答:"
+        current_answer = self.llm.invoke(initial_prompt).content
+        
+        # 残りの文書で回答を精緻化
+        for doc in docs[1:]:
+            refine_prompt = f"既存の回答を以下の追加情報を使用して改善してください。\n\n既存の回答:\n{current_answer}\n\n追加情報:\n{doc.page_content}\n\n質問: {query}\n\n改善された回答:"
+            current_answer = self.llm.invoke(refine_prompt).content
+        
+        return {
+            "result": current_answer,
+            "source_documents": docs
+        }
+    
+    def _map_rerank_chain(self, query, docs):
+        # 各文書に対して回答とスコアを生成
+        scored_answers = []
+        for doc in docs:
+            prompt = f"以下の文書を使用して質問に答え、回答の確信度を1-10で評価してください。\n\n文書:\n{doc.page_content}\n\n質問: {query}\n\n回答（確信度スコア付き）:"
+            response = self.llm.invoke(prompt)
+            scored_answers.append((response.content, doc))
+        
+        # 最も良い回答を選択（簡単のため最初の回答を使用）
+        best_answer = scored_answers[0][0] if scored_answers else "回答が生成できませんでした。"
+        
+        return {
+            "result": best_answer,
+            "source_documents": docs
+        }
+
+# 必要なクラスの定義
+class CharacterTextSplitter:
+    def __init__(self, chunk_size=500, chunk_overlap=30, separator="\n"):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.separator = separator
+    
+    def split_documents(self, documents):
+        split_docs = []
+        for doc in documents:
+            text = doc.page_content
+            chunks = self._split_text(text)
+            for chunk in chunks:
+                new_doc = type(doc)(page_content=chunk, metadata=doc.metadata)
+                split_docs.append(new_doc)
+        return split_docs
+    
+    def _split_text(self, text):
+        chunks = []
+        lines = text.split(self.separator)
+        current_chunk = ""
+        
+        for line in lines:
+            if len(current_chunk) + len(line) <= self.chunk_size:
+                current_chunk += line + self.separator
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = line + self.separator
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
+class SimpleVectorStore:
+    def __init__(self, documents, embeddings):
+        self.documents = documents
+        self.embeddings = embeddings
+        self.doc_embeddings = []
+        self._embed_documents()
+    
+    def _embed_documents(self):
+        texts = [doc.page_content for doc in self.documents]
+        self.doc_embeddings = self.embeddings.embed_documents(texts)
+    
+    def as_retriever(self, search_kwargs=None):
+        k = search_kwargs.get("k", 5) if search_kwargs else 5
+        return SimpleRetriever(self.documents, self.embeddings, self.doc_embeddings, k)
+
+class SimpleRetriever:
+    def __init__(self, documents, embeddings, doc_embeddings, k=5):
+        self.documents = documents
+        self.embeddings = embeddings
+        self.doc_embeddings = doc_embeddings
+        self.k = k
+    
+    def get_relevant_documents(self, query):
+        # クエリのエンベディング取得
+        query_embedding = self.embeddings.embed_query(query)
+        
+        # コサイン類似度計算
+        similarities = []
+        for doc_emb in self.doc_embeddings:
+            similarity = np.dot(query_embedding, doc_emb) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(doc_emb)
+            )
+            similarities.append(similarity)
+        
+        # 上位k件のインデックス取得
+        top_indices = np.argsort(similarities)[-self.k:][::-1]
+        
+        return [self.documents[i] for i in top_indices]
+
+# BM25Retrieverの代替実装
+class SimpleBM25Retriever:
+    def __init__(self, documents, k=5):
+        self.documents = documents
+        self.k = k
+    
+    def get_relevant_documents(self, query):
+        # 簡単なキーワードマッチング（BM25の簡易版）
+        query_words = query.lower().split()
+        scored_docs = []
+        
+        for doc in self.documents:
+            content = doc.page_content.lower()
+            score = sum(content.count(word) for word in query_words)
+            if score > 0:
+                scored_docs.append((score, doc))
+        
+        # スコア順にソートして上位k件を返す
+        scored_docs.sort(key=lambda x: x[0], reverse=True)
+        return [doc for score, doc in scored_docs[:self.k]]
+
+def count_tokens(text, model="gpt-4o"):
+    """トークン数を計算する関数"""
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+def calculate_cost(input_tokens, output_tokens, model):
+    """利用料金を計算する関数（USD）"""
+    if model == "gpt-4o":
+        # GPT-4o料金（例：入力$0.03/1K、出力$0.06/1K）
+        input_cost = (input_tokens / 1000) * 0.03
+        output_cost = (output_tokens / 1000) * 0.06
+    else:  # gpt-4o-mini
+        # GPT-4o-mini料金（例：入力$0.00015/1K、出力$0.0006/1K）
+        input_cost = (input_tokens / 1000) * 0.00015
+        output_cost = (output_tokens / 1000) * 0.0006
+    
+    return input_cost + output_cost
+
+# Google Colaboratory用データ読み込み
+# Google Driveをマウント（必要に応じて）
+# from google.colab import drive
+# drive.mount('/content/drive')
+
+# データ読み込み
+# Google Colabではファイルがアップロードされたフォルダを指定
+folder_name = "/content/data"  # Google Colabの場合
+
+# フォルダが存在しない場合は作成
+if not os.path.exists(folder_name):
+    os.makedirs(folder_name)
+    print(f"フォルダ '{folder_name}' を作成しました。")
+    print("PDFファイルをアップロードしてください。")
+    print("左サイドバーのファイルアイコンから、dataフォルダにPDFファイルをドラッグ&ドロップしてください。")
+
+# PDFファイルの読み込み
+print(f"フォルダ '{folder_name}' からPDFファイルを読み込み中...")
+files = []
+if os.path.exists(folder_name):
+    files = [f for f in os.listdir(folder_name) if f.endswith('.pdf')]
+
+if not files:
+    print("❌ PDFファイルが見つかりません。")
+    print("以下の手順でPDFファイルをアップロードしてください：")
+    print("1. 左サイドバーのファイルアイコンをクリック")
+    print("2. 'data'フォルダを作成（存在しない場合）")
+    print("3. PDFファイルをdataフォルダにアップロード")
+    exit()
+
+docs = []
+for file in files:
+    file_path = os.path.join(folder_name, file)
+    print(f"読み込み中: {file}")
+    try:
+        loader = PyMuPDFLoader(file_path)
+        pages = loader.load()
+        docs.extend(pages)
+        print(f"✅ {file}: {len(pages)}ページ読み込み完了")
+    except Exception as e:
+        print(f"❌ {file} の読み込みでエラー: {str(e)}")
+
+if not docs:
+    print("❌ 読み込み可能なPDFファイルがありませんでした。")
+    exit()
+
+print(f"総計 {len(docs)} ページのドキュメントを読み込みました。")
+
+# テキスト分割
+text_splitter = CharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=30,
+    separator="\n",
+)
+
+splitted_pages = text_splitter.split_documents(docs)
+
+# エンベディング設定
+embeddings = OpenAIEmbeddings()
+
+# ベクトルデータベース設定（簡易実装）
+print("ベクトルデータベースを構築中...")
+db = SimpleVectorStore(splitted_pages, embeddings)
+
+# ハイブリッド検索の設定
+# 1. ベクトル検索用リトリーバー
+vector_retriever = db.as_retriever(search_kwargs={"k": 5})
+
+# 2. キーワード検索リトリーバー（BM25の簡易版）
+keyword_retriever = SimpleBM25Retriever(splitted_pages, k=5)
+
+# 3. ハイブリッド検索の実装
+class HybridRetriever:
+    def __init__(self, vector_retriever, keyword_retriever, vector_weight=0.7):
+        self.vector_retriever = vector_retriever
+        self.keyword_retriever = keyword_retriever
+        self.vector_weight = vector_weight
+        self.keyword_weight = 1 - vector_weight
+    
+    def get_relevant_documents(self, query):
+        # ベクトル検索結果
+        vector_docs = self.vector_retriever.get_relevant_documents(query)
+        # キーワード検索結果
+        keyword_docs = self.keyword_retriever.get_relevant_documents(query)
+        
+        # 重複を除去しながら結果をマージ
+        seen_content = set()
+        hybrid_docs = []
+        
+        # ベクトル検索結果を優先して追加
+        for doc in vector_docs:
+            if doc.page_content not in seen_content:
+                hybrid_docs.append(doc)
+                seen_content.add(doc.page_content)
+        
+        # キーワード検索結果を追加（重複除去）
+        for doc in keyword_docs:
+            if doc.page_content not in seen_content and len(hybrid_docs) < 10:
+                hybrid_docs.append(doc)
+                seen_content.add(doc.page_content)
+        
+        return hybrid_docs[:5]  # 上位5件を返す
+
+# ハイブリッドリトリーバーの作成
+hybrid_retriever = HybridRetriever(vector_retriever, keyword_retriever)
+
+# テスト用クエリ
+query = "HealthXの無料プランについて教えてください。"
+
+# 4種類のchain_typeと2種類のモデルで検証
+chain_types = ["stuff", "map_reduce", "refine", "map_rerank"]
+models = ["gpt-4o", "gpt-4o-mini"]
+
+results = []
+
+print("=" * 80)
+print("RAGシステム性能比較検証")
+print("=" * 80)
+
+for model in models:
+    for chain_type in chain_types:
+        print(f"\n【検証中】モデル: {model}, Chain Type: {chain_type}")
+        
+        try:
+            # LLMインスタンス作成
+            llm = ChatOpenAI(model_name=model, temperature=0.5)
+            
+            # SimpleRetrievalQAチェーン作成（ハイブリッド検索使用）
+            chain = SimpleRetrievalQA(
+                llm=llm,
+                retriever=hybrid_retriever,
+                chain_type=chain_type
+            )
+            
+            # 回答時間測定開始
+            start_time = time.time()
+            
+            # クエリ実行
+            result = chain({"query": query})
+            
+            # 回答時間測定終了
+            end_time = time.time()
+            response_time = end_time - start_time
+            
+            # 回答取得
+            answer = result["result"]
+            source_docs = result["source_documents"]
+            
+            # トークン数計算
+            input_text = query + " ".join([doc.page_content for doc in source_docs])
+            input_tokens = count_tokens(input_text, model)
+            output_tokens = count_tokens(answer, model)
+            total_tokens = input_tokens + output_tokens
+            
+            # 利用料金計算
+            cost = calculate_cost(input_tokens, output_tokens, model)
+            
+            # 結果保存
+            result_data = {
+                "model": model,
+                "chain_type": chain_type,
+                "response_time": response_time,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "cost_usd": cost,
+                "answer": answer[:200] + "..." if len(answer) > 200 else answer
+            }
+            results.append(result_data)
+            
+            print(f"✅ 完了 - 時間: {response_time:.2f}秒, トークン: {total_tokens}, 料金: ${cost:.6f}")
+            
+        except Exception as e:
+            print(f"❌ エラー: {str(e)}")
+            results.append({
+                "model": model,
+                "chain_type": chain_type,
+                "error": str(e)
+            })
+
+# 結果表示
+print("\n" + "=" * 100)
+print("検証結果一覧")
+print("=" * 100)
+
+print(f"{'モデル':<15} {'Chain Type':<12} {'時間(秒)':<10} {'入力トークン':<12} {'出力トークン':<12} {'総トークン':<10} {'料金(USD)':<12}")
+print("-" * 100)
+
+for result in results:
+    if "error" not in result:
+        print(f"{result['model']:<15} {result['chain_type']:<12} {result['response_time']:<10.2f} "
+              f"{result['input_tokens']:<12} {result['output_tokens']:<12} {result['total_tokens']:<10} "
+              f"${result['cost_usd']:<11.6f}")
+    else:
+        print(f"{result['model']:<15} {result['chain_type']:<12} エラー: {result['error']}")
+
+# 最適な組み合わせの推奨
+print("\n" + "=" * 50)
+print("推奨結果")
+print("=" * 50)
+
+valid_results = [r for r in results if "error" not in r]
+
+if valid_results:
+    # 最速
+    fastest = min(valid_results, key=lambda x: x['response_time'])
+    print(f"最速: {fastest['model']} + {fastest['chain_type']} ({fastest['response_time']:.2f}秒)")
+    
+    # 最安
+    cheapest = min(valid_results, key=lambda x: x['cost_usd'])
+    print(f"最安: {cheapest['model']} + {cheapest['chain_type']} (${cheapest['cost_usd']:.6f})")
+    
+    # トークン効率最良
+    most_efficient = min(valid_results, key=lambda x: x['total_tokens'])
+    print(f"トークン効率最良: {most_efficient['model']} + {most_efficient['chain_type']} ({most_efficient['total_tokens']}トークン)")
+
+print("\n検証完了!")
+print(f"ハイブリッド検索（ベクトル検索 + BM25検索）を使用しました。")
